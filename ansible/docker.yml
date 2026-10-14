@@ -1,0 +1,77 @@
+---
+# Installs Docker Engine and the Docker Compose v2 plugin from Docker's
+# official Ubuntu repository.
+- name: Install Docker and Docker Compose
+  hosts: docker_hosts
+  become: true
+  gather_facts: true
+
+  vars:
+    docker_users:
+      # Override this list with -e '{"docker_users":["user1","user2"]}'
+      # when more than the SSH user should have Docker access.
+      - "{{ ansible_user }}"
+
+  pre_tasks:
+    - name: Require Ubuntu hosts
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Ubuntu'
+        fail_msg: This playbook supports Ubuntu hosts only.
+
+  tasks:
+    - name: Install prerequisites for Docker's apt repository
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Create the apt keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Install Docker's repository signing key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Configure Docker's apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.sources
+        mode: '0644'
+        content: |
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: {{ ansible_facts['distribution_release'] }}
+          Components: stable
+          Architectures: {{ {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(ansible_facts['architecture'], ansible_facts['architecture']) }}
+          Signed-By: /etc/apt/keyrings/docker.asc
+
+    - name: Install Docker Engine and Compose
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker starts at boot
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Allow configured users to run Docker without sudo
+      ansible.builtin.user:
+        name: "{{ item }}"
+        groups: docker
+        append: true
+      loop: "{{ docker_users }}"

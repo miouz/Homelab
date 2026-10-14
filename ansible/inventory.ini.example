@@ -1,0 +1,4 @@
+[docker_hosts]
+# Match VM_USERNAME and SSH_PORT used with create-vm.sh.
+# Copy this file to inventory.ini and replace YOUR_VM_USERNAME.
+vm ansible_host=127.0.0.1 ansible_port=2222 ansible_user=YOUR_VM_USERNAME ansible_python_interpreter=/usr/bin/python3.12

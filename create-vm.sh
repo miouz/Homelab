@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
 
-# Create a per-developer Ubuntu cloud VM and start it with QEMU/KVM.
+# Create a per-developer Ubuntu cloud VM and start it with QEMU acceleration.
 set -Eeuo pipefail
 
 usage() {
     cat <<'USAGE'
 Usage:
-  VM_DIR=/path/to/vm VM_USERNAME=yourname SSH_PUBLIC_KEY=~/.ssh/id_ed25519.pub \
-    ./scripts/create-vm.sh
+  VM_DIR=/path/to/vm VM_USERNAME=yourname SSH_PUBLIC_KEY=~/.ssh/id_rsa.pub \
+    ./create-vm.sh
 
-On Linux, the default VM directory is /goinfre/$USER/vm. The script downloads
-the pinned Ubuntu 24.04 LTS cloud image matching the host architecture, makes
-a private writable copy, and configures its first boot with your SSH public key.
+On Linux, the default VM directory is /goinfre/$USER/vm and QEMU uses KVM.
+On macOS, the default is ~/vm and QEMU uses Hypervisor.framework (HVF).
+Install QEMU first (for example, `brew install qemu` on macOS). The script
+downloads the pinned Ubuntu 24.04 LTS cloud image matching the host
+architecture, makes a private writable copy, and configures its first boot
+with your SSH public key.
 
 Optional environment settings:
-  VM_DIR             VM working directory (default: /goinfre/$USER/vm)
+  VM_DIR             VM working directory (default: /goinfre/$USER/vm on Linux; ~/vm on macOS)
   VM_USERNAME        Guest account (default: current host username)
   VM_HOSTNAME        Guest hostname (default: dev-<VM_USERNAME>)
-  SSH_PUBLIC_KEY     Public key file (default: ~/.ssh/id_ed25519.pub)
+  SSH_PUBLIC_KEY     Public key file (default: ~/.ssh/id_rsa.pub)
   DISK_SIZE_GB       Virtual disk maximum in GiB (default: 50)
   VM_MEMORY          Guest RAM (default: 6G)
   VM_CPUS            Guest vCPUs (default: 4)
   SSH_PORT           Host port forwarded to guest port 22 (default: 2222)
   VM_DEBUG           Show guest VGA window and serial console in foreground (default: 0; set to 1 to debug)
+  DOCKER_ENGINE_VERSION   Docker Engine/CLI apt version (default: 5:29.9.0-1~ubuntu.24.04~noble)
+  DOCKER_COMPOSE_VERSION  Docker Compose plugin apt version (default: 5.6.0-1~ubuntu.24.04~noble)
+  DOCKER_BUILDX_VERSION   Docker Buildx plugin apt version (default: 0.38.0-1~ubuntu.24.04~noble)
+  CONTAINERD_VERSION      containerd.io apt version (default: 2.4.1-2~ubuntu.24.04~noble)
   AMD64_UEFI_CODE    AMD64 OVMF code firmware file, if not auto-detected
   AMD64_UEFI_VARS    AMD64 OVMF writable variables template, if not auto-detected
   ARM_UEFI_CODE      ARM64 UEFI code firmware file, if not auto-detected
@@ -41,8 +48,16 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 (( $# == 0 )) || { usage >&2; exit 2; }
 
-[[ "$(uname -s)" == Linux ]] || fail \
-    "this version supports Linux with KVM; macOS/HVF support is not implemented yet."
+host_os=$(uname -s)
+case "$host_os" in
+    Linux)
+        acceleration=kvm
+        ;;
+    Darwin)
+        acceleration=hvf
+        ;;
+    *) fail "unsupported host operating system: $host_os (supported: Linux, macOS)." ;;
+esac
 
 host_arch=$(uname -m)
 case "$host_arch" in
@@ -57,23 +72,53 @@ case "$host_arch" in
     *) fail "unsupported host architecture: $host_arch (supported: x86_64, aarch64)." ;;
 esac
 
+# An ARM64 Ubuntu guest on Apple silicon can use HVF for native CPU execution.
+# Running the amd64 image there would require slow, fully emulated CPU execution.
+if [[ "$host_os" == Darwin && "$image_arch" != arm64 ]]; then
+    fail "macOS support is for Apple-silicon hosts (arm64) and starts a native ARM64 Ubuntu guest."
+fi
+
 for command_name in "$qemu_bin" qemu-img python3; do
     command -v "$command_name" >/dev/null 2>&1 || fail \
         "required command '$command_name' was not found."
 done
-[[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || fail \
-    "KVM is not accessible to this user at /dev/kvm. Ask your administrator to enable user access; this script will not use sudo."
+if [[ "$acceleration" == kvm ]]; then
+    [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || fail \
+        "KVM is not accessible to this user at /dev/kvm. Ask your administrator to enable user access; this script will not use sudo."
+fi
+
+# Homebrew installs the EDK II firmware that QEMU needs to boot an ARM64 cloud
+# image under its QEMU share directory. Keep the standard locations too, so a
+# manually installed QEMU can still be used by setting ARM_UEFI_{CODE,VARS}.
+macos_qemu_share_dirs=()
+if [[ "$host_os" == Darwin ]]; then
+    if command -v brew >/dev/null 2>&1; then
+        qemu_brew_prefix=$(brew --prefix qemu 2>/dev/null || true)
+        [[ -z "$qemu_brew_prefix" ]] || macos_qemu_share_dirs+=("$qemu_brew_prefix/share/qemu")
+    fi
+    macos_qemu_share_dirs+=(/opt/homebrew/share/qemu /usr/local/share/qemu)
+fi
 
 login_name=${USER:-$(id -un)}
-vm_dir=${VM_DIR:-/goinfre/$login_name/vm}
+if [[ "$host_os" == Darwin ]]; then
+    default_vm_dir=$HOME/vm
+else
+    default_vm_dir=/goinfre/$login_name/vm
+fi
+vm_dir=${VM_DIR:-$default_vm_dir}
 vm_username=${VM_USERNAME:-$login_name}
 vm_hostname=${VM_HOSTNAME:-dev-$vm_username}
-ssh_public_key=${SSH_PUBLIC_KEY:-$HOME/.ssh/id_ed25519.pub}
+ssh_public_key=${SSH_PUBLIC_KEY:-$HOME/.ssh/id_rsa.pub}
 disk_size_gb=${DISK_SIZE_GB:-50}
 vm_memory=${VM_MEMORY:-6G}
 vm_cpus=${VM_CPUS:-4}
 ssh_port=${SSH_PORT:-2222}
 vm_debug=${VM_DEBUG:-0}
+# Pin Docker's packages so every VM rebuild receives the same toolchain.
+docker_engine_version=${DOCKER_ENGINE_VERSION:-5:29.9.0-1~ubuntu.24.04~noble}
+docker_compose_version=${DOCKER_COMPOSE_VERSION:-5.6.0-1~ubuntu.24.04~noble}
+docker_buildx_version=${DOCKER_BUILDX_VERSION:-0.38.0-1~ubuntu.24.04~noble}
+containerd_version=${CONTAINERD_VERSION:-2.4.1-2~ubuntu.24.04~noble}
 # Pin one published image build so teammates start from matching guest images.
 ubuntu_image_release=20260926
 disk_path=$vm_dir/ubuntu-server-cloud-$image_arch-$ubuntu_image_release.qcow2
@@ -98,13 +143,17 @@ needs_first_boot=false
     "VM_MEMORY must be a positive number followed by G or M (for example, 6G)."
 [[ "$vm_debug" == 0 || "$vm_debug" == 1 ]] || fail \
     "VM_DEBUG must be 0 or 1."
+for package_version in "$docker_engine_version" "$docker_compose_version" "$docker_buildx_version" "$containerd_version"; do
+    [[ "$package_version" =~ ^[A-Za-z0-9:.+~=-]+$ ]] || fail \
+        "Docker package versions may contain only letters, digits, colon, dot, plus, tilde, equals, and hyphen."
+done
 
 read -r key_type key_data _ < "$ssh_public_key"
 [[ "$key_type" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))$ && -n "$key_data" ]] || fail \
     "'$ssh_public_key' does not look like a supported OpenSSH public key."
 ssh_key=$(<"$ssh_public_key")
 
-mkdir -p -- "$vm_dir" "$image_dir"
+mkdir -p "$vm_dir" "$image_dir"
 chmod 700 "$vm_dir"
 
 if [[ ! -e "$disk_path" ]]; then
@@ -182,15 +231,53 @@ PYTHON
 
     # No password is embedded in the image. Each first boot receives this
     # developer's account name and public key through a read-only NoCloud seed.
-    mkdir -p -- "$seed_dir"
+    mkdir -p "$seed_dir"
     chmod 700 "$seed_dir"
     instance_id="dev-${login_name}-$(date +%s)"
-    python3 - "$seed_dir" "$vm_username" "$vm_hostname" "$instance_id" "$ssh_key" <<'PYTHON'
+    python3 - "$seed_dir" "$vm_username" "$vm_hostname" "$instance_id" "$ssh_key" \
+        "$image_arch" "$docker_engine_version" "$docker_compose_version" "$docker_buildx_version" "$containerd_version" <<'PYTHON'
 import json
 import os
 import sys
 
-seed_dir, username, hostname, instance_id, public_key = sys.argv[1:]
+(
+    seed_dir,
+    username,
+    hostname,
+    instance_id,
+    public_key,
+    architecture,
+    docker_engine_version,
+    docker_compose_version,
+    docker_buildx_version,
+    containerd_version,
+) = sys.argv[1:]
+docker_architecture = {"amd64": "amd64", "arm64": "arm64"}[architecture]
+docker_source = "\n".join([
+    "Types: deb",
+    "URIs: https://download.docker.com/linux/ubuntu",
+    "Suites: noble",
+    "Components: stable",
+    f"Architectures: {docker_architecture}",
+    "Signed-By: /etc/apt/keyrings/docker.asc",
+    "",
+])
+runcmd = [
+    ["install", "-m", "0755", "-d", "/etc/apt/keyrings"],
+    ["curl", "-fsSL", "https://download.docker.com/linux/ubuntu/gpg", "-o", "/etc/apt/keyrings/docker.asc"],
+    ["chmod", "a+r", "/etc/apt/keyrings/docker.asc"],
+    ["apt-get", "update"],
+    [
+        "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y",
+        f"docker-ce={docker_engine_version}",
+        f"docker-ce-cli={docker_engine_version}",
+        f"containerd.io={containerd_version}",
+        f"docker-buildx-plugin={docker_buildx_version}",
+        f"docker-compose-plugin={docker_compose_version}",
+    ],
+    ["systemctl", "enable", "--now", "docker"],
+    ["usermod", "-aG", "docker", username],
+]
 cloud_config = "\n".join([
     "#cloud-config",
     f"hostname: {json.dumps(hostname)}",
@@ -209,7 +296,15 @@ cloud_config = "\n".join([
     f"      - {json.dumps(public_key)}",
     "packages:",
     "  - openssh-server",
+    "  - ca-certificates",
+    "  - curl",
     "package_update: true",
+    "write_files:",
+    "  - path: /etc/apt/sources.list.d/docker.sources",
+    "    permissions: '0644'",
+    f"    content: {json.dumps(docker_source)}",
+    "runcmd:",
+    *[f"  - {json.dumps(command)}" for command in runcmd],
     "",
 ])
 files = {
@@ -244,7 +339,7 @@ qemu_args=(
 )
 
 if [[ "$image_arch" == amd64 ]]; then
-    qemu_args+=( -enable-kvm -cpu host -boot order=c )
+    qemu_args+=( -accel "$acceleration" -cpu host -boot order=c )
     firmware_code=${AMD64_UEFI_CODE:-}
     firmware_vars_template=${AMD64_UEFI_VARS:-}
     for firmware_pair in \
@@ -262,7 +357,7 @@ if [[ "$image_arch" == amd64 ]]; then
         "AMD64 OVMF UEFI variables template was not found; install the host OVMF package or set AMD64_UEFI_VARS."
     firmware_vars=$vm_dir/amd64-uefi-vars-$ubuntu_image_release.fd
     if [[ ! -e "$firmware_vars" ]]; then
-        cp -- "$firmware_vars_template" "$firmware_vars"
+        cp "$firmware_vars_template" "$firmware_vars"
         chmod 600 "$firmware_vars"
     fi
     qemu_args+=(
@@ -270,7 +365,7 @@ if [[ "$image_arch" == amd64 ]]; then
         -drive "if=pflash,format=raw,unit=1,file=$firmware_vars"
     )
 else
-    qemu_args+=( -machine virt,accel=kvm -cpu host -boot order=c )
+    qemu_args+=( -machine "virt,accel=$acceleration" -cpu host -boot order=c )
     firmware_code=${ARM_UEFI_CODE:-}
     firmware_vars_template=${ARM_UEFI_VARS:-}
     for candidate in /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/edk2/aarch64/QEMU_EFI-pflash.raw; do
@@ -279,13 +374,19 @@ else
     for candidate in /usr/share/AAVMF/AAVMF_VARS.fd /usr/share/edk2/aarch64/vars-template-pflash.raw; do
         [[ -n "$firmware_vars_template" || ! -f "$candidate" ]] || firmware_vars_template=$candidate
     done
+    for qemu_share_dir in "${macos_qemu_share_dirs[@]}"; do
+        candidate=$qemu_share_dir/edk2-aarch64-code.fd
+        [[ -n "$firmware_code" || ! -r "$candidate" ]] || firmware_code=$candidate
+        candidate=$qemu_share_dir/edk2-arm-vars.fd
+        [[ -n "$firmware_vars_template" || ! -r "$candidate" ]] || firmware_vars_template=$candidate
+    done
     [[ -r "$firmware_code" ]] || fail \
-        "ARM64 UEFI code firmware was not found; set ARM_UEFI_CODE to its path."
+        "ARM64 UEFI code firmware was not found; install QEMU with Homebrew or set ARM_UEFI_CODE."
     [[ -r "$firmware_vars_template" ]] || fail \
-        "ARM64 UEFI variables template was not found; set ARM_UEFI_VARS to its path."
+        "ARM64 UEFI variables template was not found; install QEMU with Homebrew or set ARM_UEFI_VARS."
     firmware_vars=$vm_dir/arm64-uefi-vars-$ubuntu_image_release.fd
     if [[ ! -e "$firmware_vars" ]]; then
-        cp -- "$firmware_vars_template" "$firmware_vars"
+        cp "$firmware_vars_template" "$firmware_vars"
         chmod 600 "$firmware_vars"
     fi
     qemu_args+=(
@@ -307,8 +408,12 @@ fi
 # background. Debug mode keeps QEMU in the foreground, opens the guest VGA
 # display, and connects the serial console and monitor to this terminal.
 if [[ "$vm_debug" == 1 ]]; then
-    printf 'Debug mode: QEMU stays in the foreground with a VGA window; use Ctrl-A C to switch between the serial console and QEMU monitor.\n'
-    qemu_args+=( -display gtk -serial mon:stdio )
+    printf 'Debug mode: QEMU stays in the foreground with a display window; use Ctrl-A C to switch between the serial console and QEMU monitor.\n'
+    if [[ "$host_os" == Darwin ]]; then
+        qemu_args+=( -display default -serial mon:stdio )
+    else
+        qemu_args+=( -display gtk -serial mon:stdio )
+    fi
 else
     qemu_args+=( -display none -daemonize )
 fi
