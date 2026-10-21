@@ -1,0 +1,32 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Secrets and keys
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+*credentials*
+
+# Ansible
+.vault_pass*
+ansible/inventory/private/
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!*.tfvars.example
+
+# Backups
+backups/
+*.sql
+*.dump
+*.bak
+
+# Local configuration
+config/private/
