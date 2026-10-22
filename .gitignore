@@ -30,3 +30,9 @@ backups/
 
 # Local configuration
 config/private/
+
+# Generated local VM files
+.vm/
+
+# Local Obsidian settings and workspace
+notes/.obsidian/

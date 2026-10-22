@@ -12,8 +12,10 @@
 ## My approval is required
 
 - You may read files and perform read-only checks.
-- Before creating, editing or deleting files, show the proposed changes and wait
-  for my explicit approval.
-- Before changing infrastructure, installing software, committing, pushing or
-  deploying, explain the action and wait for approval.
+- Before Codex creates, edits or deletes files, show the proposed changes
+  and wait for my explicit approval.
+- Before Codex changes infrastructure, installs software, commits, pushes
+  or deploys, explain the action and wait for approval.
+- Commands you provide for me to run do not require a separate confirmation.
+  Explain their purpose and effects, then let me run them and share results.
 - Approval covers only the agreed scope. Silence is not approval.
